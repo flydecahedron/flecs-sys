@@ -11,3 +11,9 @@ cmake = "0.1.45"
 bindgen = "0.58.1"
 
 [dependencies]
+chumsky = "0.5.0"
+wasmtime = "0.31.0"
+anyhow = "1.0"
+notify = "4.0"
+atomic_refcell = "0.1"
+ariadne = "0.1.3"
