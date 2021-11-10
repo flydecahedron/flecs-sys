@@ -9,6 +9,7 @@ use std::{collections::HashMap, env, fs, fmt};
 use std::sync::{mpsc::channel, Arc};
 use std::thread;
 use std::time::Duration;
+use std::str;
 
 use anyhow::{anyhow, Result};
 use atomic_refcell::AtomicRefCell;
@@ -642,13 +643,26 @@ unsafe extern "C" fn move_sys(it: *mut ecs_iter_t) {
 /// Path to the Compiled WASM File from assembly script.
 const WASM_FILE_PATH: &str = "./build/optimized.wasm";
 
+// https://stackoverflow.com/questions/49604196/arbitrary-bytes-in-webassembly-data-section
 const WASM_WAT: &str = r#"
 (module
     (import "host" "hello" (func $host_new_id_fn (result i64)))
+    (import "host" "hello" (func $host_new_component_fn (param i32 i32 i32 i32) (result i64)))
 
     (func (export "hello") (result i64)
         call $host_new_id_fn
         )
+    (func (export "component_test") (result i64)
+        i32.const 0 ;; comp_ptr
+        i32.const 8 ;; comp_len
+        i32.const 8 ;; str_ptr
+        i32.const 4 ;; str_len
+        call $host_new_component_fn
+        )
+    (memory (export "memory") 1)
+    (data (i32.const 0) "\04\02")
+    (data (i32.const 4) "\06\09")
+    (data (i32.const 8) "Test")
 )
 "#;
 
@@ -701,6 +715,65 @@ fn host_new_entity(mut caller: Caller<'_, World>) -> i64 {
     return id as i64;
 }
 
+fn host_new_component(
+    mut caller: Caller<'_, World>,
+    comp_ptr: i32, 
+    comp_len: i32,
+    str_ptr: i32,
+    str_len: i32) 
+    -> i64 {
+    let ecs = caller.data_mut().ecs.clone();
+
+    let mem = match caller.get_export("memory") {
+        Some(Extern::Memory(mem)) => mem,
+        _ => {
+            // Err(Trap::new("failed to find host memory"));
+            return 0;
+        },
+    };
+
+    // component string
+    let data = mem.data(&caller)
+        .get(str_ptr as u32 as usize..)
+        .and_then(|arr| arr.get(..str_len as u32 as usize));
+    let comp_string = match data {
+        Some(data) => match str::from_utf8(data) {
+            Ok(s) => s,
+            Err(_) => {
+                // Err(Trap::new("invalid utf-8"));
+                return 0;
+            },
+        },
+        None => {
+            // Err(Trap::new("pointer/length out of bounds"));
+            return 0;
+        },
+    };
+    
+    let comp_string = comp_string.clone();
+    // component data
+    let comp_data = mem.data(&caller)
+        .get(comp_ptr as u32 as usize..)
+        .and_then(|arr| arr.get(..comp_len as u32 as usize));
+    let name = CString::new(comp_string).unwrap().as_ptr();
+    unsafe {
+        let mut id = 0;
+        {
+            id = ecs_new_component(
+                ecs,
+                0,
+                name,
+                unsafe {std::mem::size_of_val(&comp_data) },
+                unsafe {std::mem::align_of_val(&comp_data)},
+            );
+        }
+
+        println!("host_new_component comp_ptr {} {} str_ptr {} {} id {}\n {} {:?}", 
+        comp_ptr, comp_len, str_ptr, str_len, id, comp_string, comp_data);
+
+        return id as i64;
+    }; 
+}
 
 fn main() -> Result<()> {
     // let container = WasmModuleContainer::init()?;
@@ -721,15 +794,21 @@ fn main() -> Result<()> {
     // });
 
     let host_new_id_fn = Func::wrap(&mut store, host_new_entity);
+    let host_new_component_fn = Func::wrap(&mut store, host_new_component);
+
     // Instantiation of a module requires specifying its imports and then
     // afterwards we can fetch exports by name, as well as asserting the
     // type signature of the function with `get_typed_func`.
-    let instance = Instance::new(&mut store, &module, &[host_new_id_fn.into()])?;
+    let instance = Instance::new(&mut store, &module, &[host_new_id_fn.into(), host_new_component_fn.into()])?;
+
     let hello = instance.get_typed_func::<(), (i64), _>(&mut store, "hello")?;
+    let component_test = instance.get_typed_func::<(), (i64), _>(&mut store, "component_test")?;
 
     // And finally we can call the wasm!
     let x = hello.call(&mut store, ())?;
     println!("back in rust ecs id {}", x);
+    let x = component_test.call(&mut store, ())?;
+    println!("rust component id {}", x);
     Ok(())
 
     // Main Application Loop.
@@ -775,6 +854,12 @@ impl World {
     fn new_id(&self) -> ecs_entity_t {
         unsafe { ecs_new_id(self.ecs) }
     }
+
+    // fn new_component(&self) -> ecs_entity_t {
+    //     unsafe {
+
+    //     }
+    // }
 }
 
 fn test_ecs() {
