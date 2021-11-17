@@ -624,6 +624,9 @@ struct FlecsSystem<T> {
     ptr: *mut ecs_iter_t,
     wasm_fn: Option<WASMSystemFn>,
     store: Option<Store<T>>,
+    name: String,
+    query: String,
+    id: u64,
 }
 
 type FlecsSystemFn = unsafe extern fn(*mut ecs_iter_t);
@@ -634,10 +637,12 @@ type WASMSystemFn = TypedFunc<(i64), ()>;
 impl<T> FlecsSystem<T> {
 	fn new() -> FlecsSystem<T> {
 		// initialize ffi_Object here
-		FlecsSystem { ptr: std::ptr::null_mut(), wasm_fn: None, store: None}
+		FlecsSystem { ptr: std::ptr::null_mut(), wasm_fn: None, store: None, 
+            name: "uninitialized".to_string(), query: "uninitialized".to_string(), id: 0}
 	}
 	fn from_ptr(ptr: *mut ecs_iter_t, ) -> FlecsSystem<T> {
-		FlecsSystem { ptr: ptr, wasm_fn: None, store: None}
+		FlecsSystem { ptr: ptr, wasm_fn: None, store: None,
+            name: "uninitialized".to_string(), query: "uninitialized".to_string(), id: 0}
 	}
 
     fn set_wasm_fn(&mut self, wasm_fn: WASMSystemFn) {
@@ -649,12 +654,12 @@ impl<T> FlecsSystem<T> {
     }
 	fn push_callback(&mut self, cb: FlecsSystemFn, world: *mut ecs_world_t) {
         unsafe {
-            ecs_new_system(
+            self.id = ecs_new_system(
                 world,
                 0,
-                CString::new("Test system").unwrap().as_ptr(),
+                CString::new(self.name.clone()).unwrap().as_ptr(),
                 EcsOnUpdate as u64,
-                CString::new("Test").unwrap().as_ptr(),
+                CString::new(self.query.clone()).unwrap().as_ptr(),
                 Some(cb),
             );
         }
@@ -690,7 +695,7 @@ fn wrap_callback<T, F: Fn(&mut FlecsSystem<T>)>(_: F) -> FlecsSystemFn {
 }
 
 // Usage
-fn our_callback(system: &mut FlecsSystem<World>) {
+fn wasm_system_callback(system: &mut FlecsSystem<World>) {
 	system.call_wasm_fn();
 }
 
@@ -704,6 +709,7 @@ const WASM_WAT: &str = r#"
     (import "host" "hello" (func $host_new_id_fn (result i64)))
     (import "host" "hello" (func $host_new_component_fn (param i32 i32 i32 i32) (result i64)))
     (import "host" "hello" (func $host_print_i64_fn (param i64)))
+    (import "host" "hello" (func $host_new_system_fn (param i32 i32 i32 i32) (result i64)))
 
     (func (export "hello") (result i64)
         call $host_new_id_fn
@@ -720,10 +726,24 @@ const WASM_WAT: &str = r#"
         i64.const 42
         call $host_print_i64_fn
     )
+
+    (func (export "fred") (param i64)
+        call $host_print_i64_fn ;; this should print the value of the pointer to ecs_iter_t
+    )
+
+    (func (export "new_system_test") (result i64)
+        i32.const 12 ;; sys_name_ptr
+        i32.const 4 ;; sys_name_len
+        i32.const 8 ;; query_ptr
+        i32.const 4 ;; query_len
+        call $host_new_system_fn
+        )
     (memory (export "memory") 1)
     (data (i32.const 0) "\04\02")
     (data (i32.const 4) "\06\09")
     (data (i32.const 8) "Test")
+    (data (i32.const 12) "fred")
+
 )
 "#;
 
@@ -777,6 +797,81 @@ fn host_new_entity(mut caller: Caller<'_, &World>) -> i64 {
     let id = world.new_id();
     println!("New id {} from WebAssembly", id);
     return id as i64;
+}
+
+
+fn host_new_system(
+    mut caller: Caller<'_, &World>,
+    sys_name_ptr: i32, 
+    sys_name_len: i32,
+    query_ptr: i32,
+    query_len: i32) 
+    -> i64 {
+    let ecs = caller.data_mut().ecs.clone();
+
+    let mem = match caller.get_export("memory") {
+        Some(Extern::Memory(mem)) => mem,
+        _ => {
+            // Err(Trap::new("failed to find host memory"));
+            return 0;
+        },
+    };
+
+    // system name string
+    let data = mem.data(&caller)
+        .get(sys_name_ptr as u32 as usize..)
+        .and_then(|arr| arr.get(..sys_name_len as u32 as usize));
+    let sys_name_string = match data {
+        Some(data) => match str::from_utf8(data) {
+            Ok(s) => s,
+            Err(_) => {
+                // Err(Trap::new("invalid utf-8"));
+                return 0;
+            },
+        },
+        None => {
+            // Err(Trap::new("pointer/length out of bounds"));
+            return 0;
+        },
+    };
+    
+    let sys_name_string = sys_name_string.to_string();
+    
+    let data = mem.data(&caller)
+        .get(sys_name_ptr as u32 as usize..)
+        .and_then(|arr| arr.get(..sys_name_len as u32 as usize));
+    let query_string = match data {
+        Some(data) => match str::from_utf8(data) {
+            Ok(s) => s,
+            Err(_) => {
+                // Err(Trap::new("invalid utf-8"));
+                return 0;
+            },
+        },
+        None => {
+            // Err(Trap::new("pointer/length out of bounds"));
+            return 0;
+        },
+    };
+    let query_string = query_string.to_string();
+
+    // let system_fn = wasm_system_func::<&World>("system_test".to_string(), 
+    // &caller.data().instance.unwrap(), caller.as_context_mut().into());
+
+    let system_fn = caller.get_export(&sys_name_string).unwrap();
+    let system_fn = system_fn.into_func().unwrap()
+                                                       .typed::<(i64), (), _>(&caller).unwrap();
+    let mut flecs_system: FlecsSystem<World> = FlecsSystem::new();
+    flecs_system.name = sys_name_string.to_string();
+    flecs_system.query = query_string.to_string();
+    flecs_system.wasm_fn = Some(system_fn);
+    let wrapped = wrap_callback(wasm_system_callback);
+    flecs_system.push_callback(wrapped, ecs);
+
+    println!("host_new_system sys_name_ptr {} {} query_ptr {} {} id {}\n {} {:?}", 
+    sys_name_ptr, sys_name_len, query_ptr,  query_len, flecs_system.id, sys_name_string, query_string);
+
+    return flecs_system.id as i64;
 }
 
 fn host_new_component(
@@ -853,7 +948,7 @@ fn main() -> Result<()> {
     // thread::spawn(move || watch_for_changes(container2));
 
 
-    let world = World::new();
+    let mut world = World::new();
 
     let engine = Engine::default();
     let module = Module::new(&engine, WASM_WAT)?;
@@ -877,6 +972,8 @@ fn main() -> Result<()> {
             host_print_i64_fn.into(),
         ])?;
 
+    // world.instance = Some(&instance);
+
     let hello = instance.get_typed_func::<(), (i64), _>(&mut store, "hello")?;
     let component_test = instance.get_typed_func::<(), (i64), _>(&mut store, "component_test")?;
 
@@ -890,7 +987,7 @@ fn main() -> Result<()> {
     println!("rust component id {}", x);
 
     let mut flecs_system: FlecsSystem<World> = FlecsSystem::new();
-    let wrapped = wrap_callback(our_callback);
+    let wrapped = wrap_callback(wasm_system_callback);
     flecs_system.push_callback(wrapped, world.ecs.clone());
 
 
@@ -927,13 +1024,14 @@ fn main() -> Result<()> {
 
 struct World {
     ecs: *mut ecs_world_t,
+    // instance: Option<&'a Instance>,
 
 }
 
 impl World {
     fn new() -> World {
 		// initialize ffi_Object here
-		unsafe { World { ecs: ecs_init() } }
+		unsafe { World { ecs: ecs_init()  } }
 	}
 
     fn new_id(&self) -> ecs_entity_t {
