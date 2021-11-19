@@ -704,48 +704,7 @@ fn wasm_system_callback(system: &mut FlecsSystem<World>) {
 const WASM_FILE_PATH: &str = "./build/optimized.wasm";
 
 // https://stackoverflow.com/questions/49604196/arbitrary-bytes-in-webassembly-data-section
-const WASM_WAT: &str = r#"
-(module
-    (import "host" "hello" (func $host_new_id_fn (result i64)))
-    (import "host" "hello" (func $host_new_component_fn (param i32 i32 i32 i32) (result i64)))
-    (import "host" "hello" (func $host_print_i64_fn (param i64)))
-    (import "host" "hello" (func $host_new_system_fn (param i32 i32 i32 i32) (result i64)))
 
-    (func (export "hello") (result i64)
-        call $host_new_id_fn
-        )
-    (func (export "component_test") (result i64)
-        i32.const 0 ;; comp_ptr
-        i32.const 8 ;; comp_len
-        i32.const 8 ;; str_ptr
-        i32.const 4 ;; str_len
-        call $host_new_component_fn
-        )
-
-    (func (export "system_test") (result i64)
-        i64.const 42
-        call $host_print_i64_fn
-    )
-
-    (func (export "fred") (param i64)
-        call $host_print_i64_fn ;; this should print the value of the pointer to ecs_iter_t
-    )
-
-    (func (export "new_system_test") (result i64)
-        i32.const 12 ;; sys_name_ptr
-        i32.const 4 ;; sys_name_len
-        i32.const 8 ;; query_ptr
-        i32.const 4 ;; query_len
-        call $host_new_system_fn
-        )
-    (memory (export "memory") 1)
-    (data (i32.const 0) "\04\02")
-    (data (i32.const 4) "\06\09")
-    (data (i32.const 8) "Test")
-    (data (i32.const 12) "fred")
-
-)
-"#;
 
 /// WASM Module Container is a simple wrapper around the [`Module`] from `wasmtime` crate so it could be shared between threads easily
 /// it also contains the Engine that would be used to compile the module.
@@ -941,6 +900,52 @@ fn indirect_func<T>(name: String, instance: &Instance, mut store: &mut Store<T>)
 fn wasm_system_func<T>(name: String, instance: &Instance, mut store: &mut Store<T>) -> TypedFunc<(i64), ()> {
     instance.get_typed_func::<(i64), (), _>(&mut store, &name).unwrap()
 }
+
+const WASM_WAT: &str = r#"
+(module
+    (import "host" "hello" (func $host_new_id_fn (result i64)))
+    (import "host" "hello" (func $host_new_component_fn (param i32 i32 i32 i32) (result i64)))
+    (import "host" "hello" (func $host_print_i64_fn (param i64)))
+    (import "host" "hello" (func $host_new_system_fn (param i32 i32 i32 i32) (result i64)))
+
+    (func (export "hello") (result i64)
+        call $host_new_id_fn
+        )
+    (func (export "component_test") (result i64)
+        i32.const 0 ;; comp_ptr
+        i32.const 8 ;; comp_len
+        i32.const 8 ;; str_ptr
+        i32.const 4 ;; str_len
+        call $host_new_component_fn
+        )
+
+    (func (export "fred") (param i64)
+        local.get 0
+        call $host_print_i64_fn ;; this should print the value of the pointer to ecs_iter_t
+    )
+
+    (func $new_system_test (result i64)
+        i32.const 12 ;; sys_name_ptr
+        i32.const 4 ;; sys_name_len
+        i32.const 8 ;; query_ptr 
+        i32.const 4 ;; query_len
+        call $host_new_system_fn
+        )
+
+    (func (export "main") 
+        call $new_system_test
+        call $host_print_i64_fn 
+    )
+
+    (memory (export "memory") 1)
+    (data (i32.const 0) "\04\02")
+    (data (i32.const 4) "\06\09")
+    (data (i32.const 8) "Test")
+    (data (i32.const 12) "fred")
+
+)
+"#;
+
 fn main() -> Result<()> {
     // let container = WasmModuleContainer::init()?;
     // let container2 = container.clone();
@@ -962,6 +967,7 @@ fn main() -> Result<()> {
     let host_new_id_fn = Func::wrap(&mut store, host_new_entity);
     let host_new_component_fn = Func::wrap(&mut store, host_new_component);
     let host_print_i64_fn = Func::wrap(&mut store, host_print_i64);
+    let host_new_system_fn = Func::wrap(&mut store, host_new_system);
 
     // Instantiation of a module requires specifying its imports and then
     // afterwards we can fetch exports by name, as well as asserting the
@@ -970,6 +976,7 @@ fn main() -> Result<()> {
             host_new_id_fn.into(), 
             host_new_component_fn.into(),
             host_print_i64_fn.into(),
+            host_new_system_fn.into(),
         ])?;
 
     // world.instance = Some(&instance);
@@ -978,7 +985,9 @@ fn main() -> Result<()> {
     let component_test = instance.get_typed_func::<(), (i64), _>(&mut store, "component_test")?;
 
     let component_test = indirect_func::<&World>("component_test".to_string(), &instance, &mut store);
-    let system_test = wasm_system_func::<&World>("system_test".to_string(), &instance, &mut store);
+    //let system_test = wasm_system_func::<&World>("system_test".to_string(), &instance, &mut store);
+
+    let main_fn = instance.get_typed_func::<(), (), _>(&mut store, "main")?;
 
     // And finally we can call the wasm!
     let x = hello.call(&mut store, ())?;
@@ -986,9 +995,17 @@ fn main() -> Result<()> {
     let x = component_test.call(&mut store, ())?;
     println!("rust component id {}", x);
 
-    let mut flecs_system: FlecsSystem<World> = FlecsSystem::new();
-    let wrapped = wrap_callback(wasm_system_callback);
-    flecs_system.push_callback(wrapped, world.ecs.clone());
+    main_fn.call(&mut store, ())?;
+
+    unsafe {
+        ecs_progress(world.ecs, 0.0);
+        ecs_progress(world.ecs, 0.0);
+        ecs_progress(world.ecs, 0.0);
+    }
+
+    // let mut flecs_system: FlecsSystem<World> = FlecsSystem::new();
+    // let wrapped = wrap_callback(wasm_system_callback);
+    // flecs_system.push_callback(wrapped, world.ecs.clone());
 
 
     Ok(())
